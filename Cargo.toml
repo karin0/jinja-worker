@@ -15,8 +15,8 @@ wasm-opt = false
 crate-type = ["cdylib"]
 
 [dependencies]
-worker = "0.3.4"
-worker-macros = "0.3.4"
+worker = "0.4.1"
+worker-macros = "0.4.1"
 console_error_panic_hook = "0.1.1"
 minijinja = "2.2.0"
 regex = "1.10.6"
