@@ -316,7 +316,23 @@ async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
             proxy_names.insert(p.name.as_str());
         }
     }
-    drop(proxy_names);
+
+    // Gather all outbound names.
+    let mut outbounds = proxy_names;
+    for name in ["DIRECT", "REJECT", "REJECT-DROP", "PASS", "COMPATIBLE"] {
+        outbounds.insert(name);
+    }
+    for g in profile.proxy_groups.iter_mut() {
+        outbounds.insert(&g.name);
+    }
+
+    // Drop rules with unknown outbounds.
+    profile.rules.retain(|rule| {
+        let p = rule.rfind(',').unwrap();
+        let name = &rule[p + 1..];
+        outbounds.contains(name)
+    });
+    drop(outbounds);
 
     if !proxy_contents.is_empty() {
         for g in profile.proxy_groups.iter_mut() {
