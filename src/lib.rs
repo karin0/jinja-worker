@@ -176,15 +176,10 @@ async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
     console_log!("cmd: {} ua: {}", cmd, ua);
 
     ua = ua.to_ascii_lowercase();
-    let is_verge = ua.contains("clash-verge");
-    let is_pc = is_verge || ua.contains("clashforwindows");
-    let is_meta = is_verge || ua.contains("clashmeta");
+    let is_pc = ua.contains("clash-verge") || ua.contains("clashforwindows");
 
     let mut ctx = BTreeMap::new();
     let yes = 1;
-    if is_meta {
-        ctx.insert("meta", yes);
-    }
     if is_pc {
         ctx.insert("pc", yes);
     }
