@@ -7,7 +7,10 @@ use indexmap::IndexMap;
 use minijinja::Environment;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
-use worker::*;
+use worker::{
+    Context, Env, Fetch, Method, Request, Response, ResponseBuilder, Result, console_log,
+    console_warn, event,
+};
 
 const USER_AGENT: &str = "ClashMetaForGenshinImpact/5.0";
 
@@ -21,7 +24,7 @@ async fn get_tmpl(env: &Env) -> String {
     let mut req = Request::new(&url, Method::Get).unwrap();
     let headers = req.headers_mut().unwrap();
     headers
-        .append("Authorization", format!("Bearer {}", token).as_str())
+        .append("Authorization", format!("Bearer {token}").as_str())
         .unwrap();
     headers
         .append("Accept", "application/vnd.github.raw+json")
@@ -51,12 +54,10 @@ async fn fetch_provider(
     let mut r = Fetch::Request(req).send().await.unwrap();
     let mut info = rule_behavior;
     let is_rule = info.is_some();
-    if !is_rule {
-        if let Ok(Some(s)) = r.headers().get("subscription-userinfo") {
-            console_log!("{}: {}", id, s);
-            if !s.is_empty() {
-                info = Some(s);
-            }
+    if !is_rule && let Ok(Some(s)) = r.headers().get("subscription-userinfo") {
+        console_log!("{}: {}", id, s);
+        if !s.is_empty() {
+            info = Some(s);
         }
     }
     (r.text().await.unwrap(), id, is_rule, info)
@@ -200,7 +201,7 @@ async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
 
     let mut deps: Vec<(Vec<&str>, Vec<&str>)> = Vec::new();
     if let Some(y) = &conf {
-        for (k, v) in y.deps.iter() {
+        for (k, v) in &y.deps {
             deps.push((k.split('-').collect(), v.split('-').collect()));
         }
     }
@@ -208,7 +209,7 @@ async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
     console_log!("deps: {:?}", deps);
     loop {
         let mut changed = false;
-        for (k, v) in deps.iter() {
+        for (k, v) in &deps {
             if k.iter().all(|c| ctx.contains_key(c)) {
                 for c in v {
                     if ctx.insert(c, yes).is_none() {
@@ -229,7 +230,7 @@ async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
     let mut r = env.render_str(tmpl, ctx).unwrap();
 
     if let Ok(rendered_info) = serde_yaml::from_str::<RenderedInfo>(&r) {
-        for (k, v) in rendered_info.repl.iter() {
+        for (k, v) in &rendered_info.repl {
             if let Ok(reg) = Regex::new(k) {
                 console_log!("replace: {:?} -> {:?}", k, v);
                 r = reg.replace_all(&r, v).to_string();
@@ -242,7 +243,7 @@ async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
     let mut profile = serde_yaml::from_str::<Profile>(&r).unwrap();
 
     let mut proxy_names = BTreeSet::new();
-    for p in profile.proxies.iter() {
+    for p in &profile.proxies {
         proxy_names.insert(p.name.as_str());
     }
 
@@ -257,10 +258,10 @@ async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
     });
     profile.rule_providers.retain(|id, p| {
         if p.typ == "http" {
-            if let Some(format) = &p.format {
-                if format != "yaml" {
-                    return true;
-                }
+            if let Some(format) = &p.format
+                && format != "yaml"
+            {
+                return true;
             }
             futs.push(fetch_provider(
                 take(&mut p.url).unwrap(),
@@ -317,7 +318,7 @@ async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
     for name in ["DIRECT", "REJECT", "REJECT-DROP", "PASS", "COMPATIBLE"] {
         outbounds.insert(name);
     }
-    for g in profile.proxy_groups.iter_mut() {
+    for g in &mut profile.proxy_groups {
         outbounds.insert(&g.name);
     }
 
@@ -330,11 +331,11 @@ async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
     drop(outbounds);
 
     if !proxy_contents.is_empty() {
-        for g in profile.proxy_groups.iter_mut() {
+        for g in &mut profile.proxy_groups {
             if let Some(uses) = &mut g.uses {
                 uses.retain(|u| {
                     if let Some(c) = proxy_contents.get(u.as_str()) {
-                        for p in c.iter() {
+                        for p in c {
                             g.proxies.push(Cow::Borrowed(p.name.as_str()));
                         }
                         false
@@ -346,7 +347,7 @@ async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
         }
 
         for c in proxy_contents.values() {
-            for p in c.iter() {
+            for p in c {
                 profile.proxies.push(Cow::Borrowed(p));
             }
         }
@@ -366,9 +367,9 @@ async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
                             "domain" => "DOMAIN,",
                             "ipcidr" => "IP-CIDR,",
                             "classical" => "",
-                            _ => panic!("unknown behavior: {}", behavior),
+                            _ => panic!("unknown behavior: {behavior}"),
                         };
-                    for r in c.iter() {
+                    for r in c {
                         profile.rules.push(pre.clone() + r + &rule[q..]);
                     }
                     continue;
