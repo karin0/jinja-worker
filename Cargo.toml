@@ -1,22 +1,15 @@
 [package]
 name = "jinja-worker"
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
 authors = ["karin0 <karin0@gmx.com>"]
-
-[package.metadata.release]
-release = false
-
-# https://github.com/rustwasm/wasm-pack/issues/1247
-[package.metadata.wasm-pack.profile.release]
-wasm-opt = false
 
 [lib]
 crate-type = ["cdylib"]
 
 [dependencies]
-worker = "0.5"
-worker-macros = "0.5"
+worker = "0.8"
+worker-macros = "0.8"
 console_error_panic_hook = "0.1.1"
 minijinja = "2.2.0"
 regex = "1.10.6"
