@@ -1,3 +1,5 @@
+mod rules;
+
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 use std::mem::take;
@@ -6,6 +8,7 @@ use futures::future::join_all;
 use indexmap::IndexMap;
 use minijinja::Environment;
 use regex::Regex;
+use rules::{Behavior, Rule, RuleSetRef};
 use serde::{Deserialize, Serialize};
 use worker::{
     Context, Env, Fetch, Method, Request, Response, ResponseBuilder, Result, console_log,
@@ -46,21 +49,22 @@ async fn get_tmpl(env: &Env) -> String {
 async fn fetch_provider(
     url: String,
     id: String,
-    rule_behavior: Option<String>,
-) -> (String, String, bool, Option<String>) {
+    rule_behavior: Option<Behavior>,
+) -> (String, String, Option<Behavior>, Option<String>) {
     let mut req = Request::new(&url, Method::Get).unwrap();
     let headers = req.headers_mut().unwrap();
     headers.append("User-Agent", USER_AGENT).unwrap();
     let mut r = Fetch::Request(req).send().await.unwrap();
-    let mut info = rule_behavior;
-    let is_rule = info.is_some();
-    if !is_rule && let Ok(Some(s)) = r.headers().get("subscription-userinfo") {
+    let mut info = None;
+    if rule_behavior.is_none()
+        && let Ok(Some(s)) = r.headers().get("subscription-userinfo")
+    {
         console_log!("{}: {}", id, s);
         if !s.is_empty() {
             info = Some(s);
         }
     }
-    (r.text().await.unwrap(), id, is_rule, info)
+    (r.text().await.unwrap(), id, rule_behavior, info)
 }
 
 #[derive(Deserialize)]
@@ -90,7 +94,7 @@ struct ProxyProvider {
 struct RuleProvider {
     #[serde(rename = "type")]
     typ: String,
-    behavior: String,
+    behavior: Behavior,
     #[serde(skip_serializing_if = "Option::is_none")]
     url: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -266,7 +270,7 @@ async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
             futs.push(fetch_provider(
                 take(&mut p.url).unwrap(),
                 id.clone(),
-                Some(take(&mut p.behavior)),
+                Some(p.behavior),
             ));
             false
         } else {
@@ -279,12 +283,12 @@ async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
     let mut proxy_contents = BTreeMap::new();
     let mut rule_contents = BTreeMap::new();
     let mut sub_info = None;
-    for (content, name, is_rule, info) in join_all(futs).await {
-        if is_rule {
+    for (content, name, behavior, info) in join_all(futs).await {
+        if let Some(behavior) = behavior {
             rule_contents.insert(
                 name,
                 (
-                    info.unwrap(),
+                    behavior,
                     yaml_serde::from_str::<RuleContent>(&content)
                         .unwrap()
                         .payload,
@@ -324,9 +328,7 @@ async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
 
     // Drop rules with unknown outbounds.
     profile.rules.retain(|rule| {
-        let p = rule.rfind(',').unwrap();
-        let name = &rule[p + 1..];
-        outbounds.contains(name)
+        Rule::parse(rule).is_none_or(|r| !r.targets_outbound() || outbounds.contains(r.target))
     });
     drop(outbounds);
 
@@ -353,28 +355,12 @@ async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
         }
     }
 
-    if !rule_contents.is_empty() {
-        let reg = Regex::new(r"RULE-SET,([^(),]+)").unwrap();
-        for rule in take(&mut profile.rules) {
-            if let Some(cap) = reg.captures(&rule) {
-                let m = cap.get(0).unwrap();
-                let p = m.start();
-                let q = m.end();
-                let id = cap.get(1).unwrap().as_str();
-                if let Some((behavior, c)) = rule_contents.get(id) {
-                    let pre = rule[..p].to_string()
-                        + match behavior.as_str() {
-                            "domain" => "DOMAIN,",
-                            "ipcidr" => "IP-CIDR,",
-                            "classical" => "",
-                            _ => panic!("unknown behavior: {behavior}"),
-                        };
-                    for r in c {
-                        profile.rules.push(pre.clone() + r + &rule[q..]);
-                    }
-                    continue;
-                }
-            }
+    for rule in take(&mut profile.rules) {
+        if let Some(set) = RuleSetRef::find(&rule)
+            && let Some((behavior, entries)) = rule_contents.get(set.id)
+        {
+            profile.rules.extend(set.expand(*behavior, entries));
+        } else {
             profile.rules.push(rule);
         }
     }
