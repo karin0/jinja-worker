@@ -14,6 +14,6 @@ console_error_panic_hook = "0.1.1"
 minijinja = "2.2.0"
 regex = "1.10.6"
 serde = { version = "1.0", features = ["derive"] }
-serde_yaml = "0.9"
+yaml_serde = "0.10.7"
 futures = "0.3.30"
 indexmap = { version = "2.4.0", features = ["serde"] }

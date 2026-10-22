@@ -83,7 +83,7 @@ struct ProxyProvider {
     #[serde(skip_serializing_if = "Option::is_none")]
     url: Option<String>,
     #[serde(flatten)]
-    extra: IndexMap<String, serde_yaml::Value>,
+    extra: IndexMap<String, yaml_serde::Value>,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -96,14 +96,14 @@ struct RuleProvider {
     #[serde(skip_serializing_if = "Option::is_none")]
     format: Option<String>,
     #[serde(flatten)]
-    extra: IndexMap<String, serde_yaml::Value>,
+    extra: IndexMap<String, yaml_serde::Value>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 struct Proxy {
     name: String,
     #[serde(flatten)]
-    extra: IndexMap<String, serde_yaml::Value>,
+    extra: IndexMap<String, yaml_serde::Value>,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -116,7 +116,7 @@ struct ProxyGroup<'a> {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     proxies: Vec<Cow<'a, str>>,
     #[serde(flatten)]
-    extra: IndexMap<String, serde_yaml::Value>,
+    extra: IndexMap<String, yaml_serde::Value>,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -144,7 +144,7 @@ struct Profile<'a> {
     #[serde(flatten)]
     _rendered_info: RenderedInfo,
     #[serde(flatten)]
-    extra: IndexMap<String, serde_yaml::Value>,
+    extra: IndexMap<String, yaml_serde::Value>,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -191,7 +191,7 @@ async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
     let tmpl_full = get_tmpl(&env).await;
     let mut tmpl = tmpl_full.as_str();
     let conf = tmpl.find("\n\n").and_then(|p| {
-        if let Ok(y) = serde_yaml::from_str::<MetaInfo>(&tmpl[..p]) {
+        if let Ok(y) = yaml_serde::from_str::<MetaInfo>(&tmpl[..p]) {
             tmpl = &tmpl[p + 2..];
             Some(y)
         } else {
@@ -229,7 +229,7 @@ async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
 
     let mut r = env.render_str(tmpl, ctx).unwrap();
 
-    if let Ok(rendered_info) = serde_yaml::from_str::<RenderedInfo>(&r) {
+    if let Ok(rendered_info) = yaml_serde::from_str::<RenderedInfo>(&r) {
         for (k, v) in &rendered_info.repl {
             if let Ok(reg) = Regex::new(k) {
                 console_log!("replace: {:?} -> {:?}", k, v);
@@ -240,7 +240,7 @@ async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
         }
     }
 
-    let mut profile = serde_yaml::from_str::<Profile>(&r).unwrap();
+    let mut profile = yaml_serde::from_str::<Profile>(&r).unwrap();
 
     let mut proxy_names = BTreeSet::new();
     for p in &profile.proxies {
@@ -285,7 +285,7 @@ async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
                 name,
                 (
                     info.unwrap(),
-                    serde_yaml::from_str::<RuleContent>(&content)
+                    yaml_serde::from_str::<RuleContent>(&content)
                         .unwrap()
                         .payload,
                 ),
@@ -297,7 +297,7 @@ async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
             }
             proxy_contents.insert(
                 name,
-                serde_yaml::from_str::<ProxyContent>(&content)
+                yaml_serde::from_str::<ProxyContent>(&content)
                     .unwrap()
                     .proxies,
             );
@@ -379,7 +379,7 @@ async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
         }
     }
 
-    let out = serde_yaml::to_string(&profile).unwrap();
+    let out = yaml_serde::to_string(&profile).unwrap();
     let mut r = ResponseBuilder::new();
     if let Some(info) = sub_info {
         r = r.with_header("subscription-userinfo", &info).unwrap();
