@@ -1,0 +1,4 @@
+minimumReleaseAge: 21600
+allowBuilds:
+  esbuild: false
+  workerd: false
