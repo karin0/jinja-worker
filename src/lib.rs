@@ -1,374 +1,140 @@
+mod profile;
 mod rules;
 
-use std::borrow::Cow;
-use std::collections::{BTreeMap, BTreeSet};
-use std::mem::take;
+use std::collections::BTreeMap;
+use std::pin::pin;
+use std::time::Duration;
 
-use futures::future::join_all;
+use futures::future::{Either, join_all, select};
 use indexmap::IndexMap;
-use minijinja::Environment;
-use regex::Regex;
-use rules::{Behavior, Rule, RuleSetRef};
-use serde::{Deserialize, Serialize};
+use profile::{Content, Profile, Proxy, Remote};
+use rules::Behavior;
 use worker::{
-    Context, Env, Fetch, Method, Request, Response, ResponseBuilder, Result, console_log,
-    console_warn, event,
+    Context, Delay, Env, Fetch, Headers, Request, RequestInit, Response, ResponseBuilder, Url,
+    console_error, console_log, console_warn, event,
 };
 
 const USER_AGENT: &str = "ClashMetaForGenshinImpact/5.0";
+const TIMEOUT: Duration = Duration::from_secs(10);
 
-async fn get_tmpl(env: &Env) -> String {
-    let token = env.secret("GH_TOKEN").unwrap();
+/// Fetches `url` and returns its body when the status is 2xx, along with the response headers.
+async fn get(url: &str, headers: &[(&str, &str)]) -> Result<(String, Headers), profile::Error> {
+    let fetch = async {
+        let h = Headers::new();
+        h.set("User-Agent", USER_AGENT)?;
+        for (k, v) in headers {
+            h.set(k, v)?;
+        }
+        let req = Request::new_with_init(url, RequestInit::new().with_headers(h))?;
+        let mut resp = Fetch::Request(req).send().await?;
+        let status = resp.status_code();
+        if !(200..300).contains(&status) {
+            return Err(format!("HTTP {status}").into());
+        }
+        Ok((resp.text().await?, resp.headers().clone()))
+    };
+    match select(pin!(fetch), Delay::from(TIMEOUT)).await {
+        Either::Left((result, _)) => result,
+        Either::Right(_) => Err(format!("timed out after {TIMEOUT:?}").into()),
+    }
+}
+
+async fn get_template(env: &Env) -> Result<String, profile::Error> {
     let url = format!(
         "https://api.github.com/repos/{}/contents/{}",
-        env.secret("GH_REPO").unwrap(),
-        env.secret("GH_PATH").unwrap()
+        env.secret("GH_REPO")?,
+        env.secret("GH_PATH")?
     );
-    let mut req = Request::new(&url, Method::Get).unwrap();
-    let headers = req.headers_mut().unwrap();
-    headers
-        .append("Authorization", format!("Bearer {token}").as_str())
-        .unwrap();
-    headers
-        .append("Accept", "application/vnd.github.raw+json")
-        .unwrap();
-    headers
-        .append("X-GitHub-Api-Version", "2022-11-28")
-        .unwrap();
-    headers.append("User-Agent", USER_AGENT).unwrap();
-
-    Fetch::Request(req)
-        .send()
-        .await
-        .unwrap()
-        .text()
-        .await
-        .unwrap()
+    let auth = format!("Bearer {}", env.secret("GH_TOKEN")?);
+    let headers = [
+        ("Authorization", auth.as_str()),
+        ("Accept", "application/vnd.github.raw+json"),
+        ("X-GitHub-Api-Version", "2022-11-28"),
+    ];
+    Ok(get(&url, &headers).await?.0)
 }
 
-async fn fetch_provider(
-    url: String,
-    id: String,
-    rule_behavior: Option<Behavior>,
-) -> (String, String, Option<Behavior>, Option<String>) {
-    let mut req = Request::new(&url, Method::Get).unwrap();
-    let headers = req.headers_mut().unwrap();
-    headers.append("User-Agent", USER_AGENT).unwrap();
-    let mut r = Fetch::Request(req).send().await.unwrap();
-    let mut info = None;
-    if rule_behavior.is_none()
-        && let Ok(Some(s)) = r.headers().get("subscription-userinfo")
-    {
-        console_log!("{}: {}", id, s);
-        if !s.is_empty() {
-            info = Some(s);
+enum Provided {
+    Proxies(Vec<Proxy>, Option<String>),
+    Rules(Behavior, Vec<String>),
+}
+
+async fn get_provider(remote: &Remote) -> Result<Provided, profile::Error> {
+    let (body, headers) = get(&remote.url, &[]).await?;
+    Ok(match remote.content {
+        Content::Proxies => Provided::Proxies(
+            profile::parse_proxies(&body)?,
+            headers
+                .get("subscription-userinfo")?
+                .filter(|s| !s.is_empty()),
+        ),
+        Content::Rules(behavior) => Provided::Rules(behavior, profile::parse_rule_payload(&body)?),
+    })
+}
+
+async fn subscription(template: &str, cmd: &str, ua: &str) -> Result<Response, profile::Error> {
+    let mut profile = Profile::parse(&profile::render(template, cmd, ua)?)?;
+    let remotes = profile.take_remotes();
+    let results = join_all(remotes.iter().map(get_provider)).await;
+
+    let mut proxies = IndexMap::new();
+    let mut rule_sets = BTreeMap::new();
+    let mut sub_info = None;
+    for (remote, result) in remotes.into_iter().zip(results) {
+        match result {
+            Ok(Provided::Proxies(list, info)) => {
+                if sub_info.is_none() {
+                    sub_info = info;
+                }
+                proxies.insert(remote.id, list);
+            }
+            Ok(Provided::Rules(behavior, payload)) => {
+                rule_sets.insert(remote.id, (behavior, payload));
+            }
+            Err(e) => console_warn!("provider {} skipped: {}", remote.id, e),
         }
     }
-    (r.text().await.unwrap(), id, rule_behavior, info)
+
+    let mut resp = ResponseBuilder::new();
+    if let Some(info) = sub_info {
+        resp = resp.with_header("subscription-userinfo", &info)?;
+    }
+    Ok(resp.ok(profile.resolve(proxies, &rule_sets)?)?)
 }
 
-#[derive(Deserialize)]
-struct MetaInfo {
-    #[serde(rename = "x-deps")]
-    deps: BTreeMap<String, String>,
-}
-
-#[derive(Deserialize, Debug)]
-struct RenderedInfo {
-    #[serde(rename = "x-repl")]
-    #[serde(default)]
-    repl: BTreeMap<String, String>,
-}
-
-#[derive(Serialize, Deserialize, Debug)]
-struct ProxyProvider {
-    #[serde(rename = "type")]
-    typ: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    url: Option<String>,
-    #[serde(flatten)]
-    extra: IndexMap<String, yaml_serde::Value>,
-}
-
-#[derive(Serialize, Deserialize, Debug)]
-struct RuleProvider {
-    #[serde(rename = "type")]
-    typ: String,
-    behavior: Behavior,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    url: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    format: Option<String>,
-    #[serde(flatten)]
-    extra: IndexMap<String, yaml_serde::Value>,
-}
-
-#[derive(Serialize, Deserialize, Debug, Clone)]
-struct Proxy {
-    name: String,
-    #[serde(flatten)]
-    extra: IndexMap<String, yaml_serde::Value>,
-}
-
-#[derive(Serialize, Deserialize, Debug)]
-struct ProxyGroup<'a> {
-    name: String,
-    #[serde(rename = "use")]
-    #[serde(skip_serializing_if = "Option::is_none")]
-    uses: Option<Vec<String>>,
-    #[serde(default)]
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    proxies: Vec<Cow<'a, str>>,
-    #[serde(flatten)]
-    extra: IndexMap<String, yaml_serde::Value>,
-}
-
-#[derive(Serialize, Deserialize, Debug)]
-struct Profile<'a> {
-    #[serde(default)]
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    proxies: Vec<Cow<'a, Proxy>>,
-    #[serde(default)]
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    rules: Vec<String>,
-    #[serde(rename = "proxy-groups")]
-    #[serde(default)]
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    proxy_groups: Vec<ProxyGroup<'a>>,
-    // Preserve the order via IndexMap to get expected 'subscription-userinfo'.
-    #[serde(rename = "proxy-providers")]
-    #[serde(default)]
-    #[serde(skip_serializing_if = "IndexMap::is_empty")]
-    proxy_providers: IndexMap<String, ProxyProvider>,
-    #[serde(rename = "rule-providers")]
-    #[serde(default)]
-    #[serde(skip_serializing_if = "IndexMap::is_empty")]
-    rule_providers: IndexMap<String, RuleProvider>,
-    #[serde(skip_serializing)]
-    #[serde(flatten)]
-    _rendered_info: RenderedInfo,
-    #[serde(flatten)]
-    extra: IndexMap<String, yaml_serde::Value>,
-}
-
-#[derive(Serialize, Deserialize, Debug)]
-struct ProxyContent {
-    proxies: Vec<Proxy>,
-}
-
-#[derive(Serialize, Deserialize, Debug)]
-struct RuleContent {
-    payload: Vec<String>,
+/// The `cmd` segment of a `/<access path>/<cmd>` request path.
+fn command<'a>(url: &'a Url, access_path: &str) -> Option<&'a str> {
+    let mut parts = url.path_segments()?;
+    match (parts.next(), parts.next(), parts.next()) {
+        (Some(access), Some(cmd), None) if access == access_path => Some(cmd),
+        _ => None,
+    }
 }
 
 #[event(fetch)]
-async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
+async fn fetch(req: Request, env: Env, _ctx: Context) -> worker::Result<Response> {
     console_error_panic_hook::set_once();
 
-    let url = req.url().unwrap();
-    let mut parts = url.path_segments().unwrap();
-    if parts.next().unwrap() != env.secret("ACCESS_PATH").unwrap().to_string() {
-        console_warn!("Bad request: {}", url);
+    let url = req.url()?;
+    let Some(cmd) = command(&url, &env.secret("ACCESS_PATH")?.to_string()) else {
+        console_warn!("bad request: {}", url.path());
         return Response::error("Not found", 404);
-    }
-    let cmd = parts.next().unwrap();
-    if parts.next().is_some() {
-        console_warn!("Bad request: {}", url);
-        return Response::error("Not found", 404);
-    }
-
-    let mut ua = req.headers().get("User-Agent").unwrap().unwrap();
+    };
+    let ua = req.headers().get("User-Agent")?.unwrap_or_default();
     console_log!("cmd: {} ua: {}", cmd, ua);
 
-    ua = ua.to_ascii_lowercase();
-    let is_pc = ua.contains("clash-verge") || ua.contains("clashforwindows");
-
-    let mut ctx = BTreeMap::new();
-    let yes = 1;
-    if is_pc {
-        ctx.insert("pc", yes);
-    }
-    for c in cmd.split('-') {
-        ctx.insert(c, yes);
-    }
-
-    let tmpl_full = get_tmpl(&env).await;
-    let mut tmpl = tmpl_full.as_str();
-    let conf = tmpl.find("\n\n").and_then(|p| {
-        if let Ok(y) = yaml_serde::from_str::<MetaInfo>(&tmpl[..p]) {
-            tmpl = &tmpl[p + 2..];
-            Some(y)
-        } else {
-            None
+    let template = match get_template(&env).await {
+        Ok(t) => t,
+        Err(e) => {
+            console_error!("template: {}", e);
+            return Response::error(format!("template unavailable: {e}"), 502);
         }
-    });
-
-    let mut deps: Vec<(Vec<&str>, Vec<&str>)> = Vec::new();
-    if let Some(y) = &conf {
-        for (k, v) in &y.deps {
-            deps.push((k.split('-').collect(), v.split('-').collect()));
+    };
+    match subscription(&template, cmd, &ua).await {
+        Ok(resp) => Ok(resp),
+        Err(e) => {
+            console_error!("{}", e);
+            Response::error(e.to_string(), 500)
         }
     }
-
-    console_log!("deps: {:?}", deps);
-    loop {
-        let mut changed = false;
-        for (k, v) in &deps {
-            if k.iter().all(|c| ctx.contains_key(c)) {
-                for c in v {
-                    if ctx.insert(c, yes).is_none() {
-                        changed = true;
-                    }
-                }
-            }
-        }
-        if !changed {
-            break;
-        }
-    }
-
-    console_log!("ctx: {:?}", ctx);
-    let mut env = Environment::new();
-    env.set_trim_blocks(true);
-
-    let mut r = env.render_str(tmpl, ctx).unwrap();
-
-    if let Ok(rendered_info) = yaml_serde::from_str::<RenderedInfo>(&r) {
-        for (k, v) in &rendered_info.repl {
-            if let Ok(reg) = Regex::new(k) {
-                console_log!("replace: {:?} -> {:?}", k, v);
-                r = reg.replace_all(&r, v).to_string();
-            } else {
-                console_warn!("bad regex: {}", k);
-            }
-        }
-    }
-
-    let mut profile = yaml_serde::from_str::<Profile>(&r).unwrap();
-
-    let mut proxy_names = BTreeSet::new();
-    for p in &profile.proxies {
-        proxy_names.insert(p.name.as_str());
-    }
-
-    let mut futs = vec![];
-    profile.proxy_providers.retain(|id, p| {
-        if p.typ == "http" {
-            futs.push(fetch_provider(take(&mut p.url).unwrap(), id.clone(), None));
-            false
-        } else {
-            true
-        }
-    });
-    profile.rule_providers.retain(|id, p| {
-        if p.typ == "http" {
-            if let Some(format) = &p.format
-                && format != "yaml"
-            {
-                return true;
-            }
-            futs.push(fetch_provider(
-                take(&mut p.url).unwrap(),
-                id.clone(),
-                Some(p.behavior),
-            ));
-            false
-        } else {
-            true
-        }
-    });
-
-    console_log!("fetching {} providers", futs.len());
-
-    let mut proxy_contents = BTreeMap::new();
-    let mut rule_contents = BTreeMap::new();
-    let mut sub_info = None;
-    for (content, name, behavior, info) in join_all(futs).await {
-        if let Some(behavior) = behavior {
-            rule_contents.insert(
-                name,
-                (
-                    behavior,
-                    yaml_serde::from_str::<RuleContent>(&content)
-                        .unwrap()
-                        .payload,
-                ),
-            );
-        } else {
-            if let (None, Some(info)) = (&sub_info, info) {
-                console_log!("sub_info: {} from {}", info, name);
-                sub_info = Some(info);
-            }
-            proxy_contents.insert(
-                name,
-                yaml_serde::from_str::<ProxyContent>(&content)
-                    .unwrap()
-                    .proxies,
-            );
-        }
-    }
-
-    for c in proxy_contents.values_mut() {
-        for p in c.iter_mut() {
-            while proxy_names.contains(p.name.as_str()) {
-                p.name.push('_');
-            }
-            proxy_names.insert(p.name.as_str());
-        }
-    }
-
-    // Gather all outbound names.
-    let mut outbounds = proxy_names;
-    for name in ["DIRECT", "REJECT", "REJECT-DROP", "PASS", "COMPATIBLE"] {
-        outbounds.insert(name);
-    }
-    for g in &mut profile.proxy_groups {
-        outbounds.insert(&g.name);
-    }
-
-    // Drop rules with unknown outbounds.
-    profile.rules.retain(|rule| {
-        Rule::parse(rule).is_none_or(|r| !r.targets_outbound() || outbounds.contains(r.target))
-    });
-    drop(outbounds);
-
-    if !proxy_contents.is_empty() {
-        for g in &mut profile.proxy_groups {
-            if let Some(uses) = &mut g.uses {
-                uses.retain(|u| {
-                    if let Some(c) = proxy_contents.get(u.as_str()) {
-                        for p in c {
-                            g.proxies.push(Cow::Borrowed(p.name.as_str()));
-                        }
-                        false
-                    } else {
-                        true
-                    }
-                });
-            }
-        }
-
-        for c in proxy_contents.values() {
-            for p in c {
-                profile.proxies.push(Cow::Borrowed(p));
-            }
-        }
-    }
-
-    for rule in take(&mut profile.rules) {
-        if let Some(set) = RuleSetRef::find(&rule)
-            && let Some((behavior, entries)) = rule_contents.get(set.id)
-        {
-            profile.rules.extend(set.expand(*behavior, entries));
-        } else {
-            profile.rules.push(rule);
-        }
-    }
-
-    let out = yaml_serde::to_string(&profile).unwrap();
-    let mut r = ResponseBuilder::new();
-    if let Some(info) = sub_info {
-        r = r.with_header("subscription-userinfo", &info).unwrap();
-    }
-    r.ok(out)
 }
