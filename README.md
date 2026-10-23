@@ -37,6 +37,12 @@ pnpm wrangler secret put GH_TOKEN   # and the other secrets
 pnpm wrangler deploy                # builds with worker-build, which needs the wasm32-unknown-unknown target
 ```
 
+A deployment on a custom route passes the worker name and the route, which carries `ACCESS_PATH`, on the command line, so they stay out of this repository:
+
+```sh
+pnpm wrangler deploy --name <worker> --route "<host>/<ACCESS_PATH>/*"
+```
+
 ## Development
 
 ```sh

@@ -1,6 +1,8 @@
 name = "jinja-worker"
 main = "build/worker/shim.mjs"
 compatibility_date = "2024-10-07"
+# A route given on the command line would otherwise turn the workers.dev URL off.
+workers_dev = true
 
 [build]
 command = "cargo install -q worker-build && worker-build --release"
