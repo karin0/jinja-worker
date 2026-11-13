@@ -5,7 +5,9 @@ compatibility_date = "2024-10-07"
 workers_dev = true
 
 [build]
-command = "cargo install -q worker-build && worker-build --release"
+# worker-build 0.9 refuses the worker crate 0.8, so the build installs the worker-build release that
+# matches the worker in Cargo.lock.
+command = "cargo install -q worker-build@^$(cargo pkgid worker | cut -d@ -f2) && worker-build --release"
 
 [observability]
 enabled = true
