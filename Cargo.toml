@@ -8,8 +8,8 @@ authors = ["karin0 <karin0@gmx.com>"]
 crate-type = ["cdylib"]
 
 [dependencies]
-worker = "0.8"
-worker-macros = "0.8"
+worker = "0.9"
+worker-macros = "0.9"
 console_error_panic_hook = "0.1.1"
 minijinja = "2.2.0"
 regex = "1.10.6"
