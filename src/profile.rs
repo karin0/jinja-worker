@@ -5,6 +5,7 @@ use std::mem::take;
 
 use indexmap::IndexMap;
 use minijinja::Environment;
+use minijinja::syntax::SyntaxConfig;
 use regex::Regex;
 use serde::de::IgnoredAny;
 use serde::{Deserialize, Serialize};
@@ -63,7 +64,7 @@ pub fn render(template: &str, cmd: &str, user_agent: &str) -> Result<String, Err
     }
 
     let mut env = Environment::new();
-    env.set_trim_blocks(true);
+    env.set_syntax(SyntaxConfig::builder().trim_blocks(true).build()?);
     let ctx: BTreeMap<&str, u8> = flags.into_iter().map(|f| (f, 1)).collect();
     let mut rendered = env.render_str(body, ctx)?;
 
